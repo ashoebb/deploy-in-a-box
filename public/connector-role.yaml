@@ -1,0 +1,184 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Deploy-in-a-Box connector role. Run this stack in YOUR AWS account. It
+  creates one IAM role that the Deploy-in-a-Box platform assumes (with your
+  unique External ID) to provision "diab-*" stacks. Delete this stack at any
+  time to revoke all access instantly. We recommend running Deploy-in-a-Box
+  in a dedicated member account of your AWS Organization.
+
+Parameters:
+  PlatformAccountId:
+    Type: String
+    AllowedPattern: "^\\d{12}$"
+    Description: The Deploy-in-a-Box platform AWS account ID (shown in your dashboard).
+  ExternalId:
+    Type: String
+    MinLength: 8
+    Description: Your unique External ID (shown in your dashboard). Prevents confused-deputy access.
+  EnableDataStudio:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >-
+      OPT-IN. Grants item-level read/write on your diab-* DynamoDB tables so
+      the dashboard's Data Studio can browse and edit records. This is access
+      to your application DATA, not just infrastructure — leave "false" unless
+      you want that feature.
+
+Conditions:
+  DataStudioEnabled: !Equals [!Ref EnableDataStudio, "true"]
+
+Resources:
+  ProvisionerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: DeployInABoxProvisioner
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${PlatformAccountId}:root"
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                sts:ExternalId: !Ref ExternalId
+      Policies:
+        - PolicyName: diab-provisioning
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # CloudFormation control plane, scoped to diab-* stacks
+              - Sid: Cfn
+                Effect: Allow
+                Action:
+                  - cloudformation:CreateStack
+                  - cloudformation:UpdateStack
+                  - cloudformation:DeleteStack
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:DescribeStackResources
+                  - cloudformation:GetTemplate
+                  - cloudformation:ValidateTemplate
+                Resource: !Sub "arn:aws:cloudformation:*:${AWS::AccountId}:stack/diab-*/*"
+              - Sid: CfnValidate
+                Effect: Allow
+                Action: cloudformation:ValidateTemplate
+                Resource: "*"
+              # Resources the customer stack creates. Name-scoped to diab-*
+              # wherever the service supports it.
+              - Sid: Dynamo
+                Effect: Allow
+                Action: dynamodb:*
+                Resource: !Sub "arn:aws:dynamodb:*:${AWS::AccountId}:table/diab-*"
+              - Sid: Lambda
+                Effect: Allow
+                Action: lambda:*
+                Resource:
+                  - !Sub "arn:aws:lambda:*:${AWS::AccountId}:function:diab-*"
+              - Sid: S3
+                Effect: Allow
+                Action: s3:*
+                Resource:
+                  - "arn:aws:s3:::diab-*"
+                  - "arn:aws:s3:::diab-*/*"
+              - Sid: IamScoped
+                Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:GetRole
+                  - iam:PutRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:GetRolePolicy
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:TagRole
+                  - iam:UntagRole
+                  - iam:PassRole
+                Resource: !Sub "arn:aws:iam::${AWS::AccountId}:role/diab-*"
+              # These services don't support name-based resource scoping at
+              # create time; access is account-wide by necessity. Using a
+              # dedicated member account contains the blast radius.
+              - Sid: CognitoApiGwCloudFront
+                Effect: Allow
+                Action:
+                  - cognito-idp:*
+                  - apigateway:*
+                  - cloudfront:CreateDistribution
+                  - cloudfront:UpdateDistribution
+                  - cloudfront:DeleteDistribution
+                  - cloudfront:GetDistribution
+                  - cloudfront:GetDistributionConfig
+                  - cloudfront:TagResource
+                  - cloudfront:UntagResource
+                  - cloudfront:ListTagsForResource
+                  - cloudfront:CreateOriginAccessControl
+                  - cloudfront:UpdateOriginAccessControl
+                  - cloudfront:DeleteOriginAccessControl
+                  - cloudfront:GetOriginAccessControl
+                  - cloudfront:GetOriginAccessControlConfig
+                  - cloudfront:ListDistributions
+                Resource: "*"
+
+        - PolicyName: diab-observability
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # ── Read-only observability: function logs + service metrics ──
+              - Sid: FunctionLogs
+                Effect: Allow
+                Action:
+                  - logs:FilterLogEvents
+                  - logs:GetLogEvents
+                  - logs:DescribeLogStreams
+                  - logs:DescribeLogGroups
+                Resource:
+                  - !Sub 'arn:aws:logs:*:${AWS::AccountId}:log-group:/aws/lambda/diab-*'
+                  - !Sub 'arn:aws:logs:*:${AWS::AccountId}:log-group:/aws/lambda/diab-*:*'
+              - Sid: ServiceMetrics
+                Effect: Allow
+                Action:
+                  - cloudwatch:GetMetricData
+                  - cloudwatch:ListMetrics
+                # GetMetricData does not support resource-level scoping (metrics
+                # are account-wide, read-only numbers) — AWS requires '*' here.
+                Resource: '*'
+
+        - !If
+          - DataStudioEnabled
+          - PolicyName: diab-datastudio
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                # ── OPT-IN: item-level access for the dashboard Data Studio ──
+                - Sid: DataStudioItems
+                  Effect: Allow
+                  Action:
+                    - dynamodb:DescribeTable
+                    - dynamodb:GetItem
+                    - dynamodb:PutItem
+                    - dynamodb:UpdateItem
+                    - dynamodb:DeleteItem
+                    - dynamodb:Query
+                    - dynamodb:Scan
+                    - dynamodb:PartiQLSelect
+                    - dynamodb:PartiQLInsert
+                    - dynamodb:PartiQLUpdate
+                    - dynamodb:PartiQLDelete
+                  Resource:
+                    - !Sub 'arn:aws:dynamodb:*:${AWS::AccountId}:table/diab-*'
+                    - !Sub 'arn:aws:dynamodb:*:${AWS::AccountId}:table/diab-*/index/*'
+          - !Ref 'AWS::NoValue'
+
+Outputs:
+  RoleVersion:
+    Description: Connector role template version (3 = provisioning + observability + optional Data Studio).
+    Value: "3"
+  DataStudio:
+    Description: Whether the optional Data Studio permission tier is granted.
+    Value: !Ref EnableDataStudio
+  RoleArn:
+    Description: Paste this ARN into your Deploy-in-a-Box dashboard.
+    Value: !GetAtt ProvisionerRole.Arn

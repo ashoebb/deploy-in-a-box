@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm install *)",
+      "Bash(node *)",
+      "Bash(export PGCONNECT_TIMEOUT=5)",
+      "Bash(PGPASSWORD='' psql -U postgres -h localhost -c \"SELECT version\\(\\);\")",
+      "Bash(PGPASSWORD='' psql -U postgres -h localhost -tAc \"SELECT 1 FROM pg_roles WHERE rolname='diab';\")",
+      "Bash(taskkill //F //IM psql.exe)",
+      "PowerShell(Restart-Service *)",
+      "Bash(PGPASSWORD='' psql *)",
+      "Bash(npm run *)"
+    ]
+  }
+}

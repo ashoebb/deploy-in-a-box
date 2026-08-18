@@ -1,0 +1,40 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html {
+    @apply antialiased;
+  }
+  body {
+    @apply bg-paper text-ink font-sans;
+  }
+  ::selection {
+    @apply bg-cargo/20;
+  }
+  :focus-visible {
+    outline: 2px solid #e8590c;
+    outline-offset: 2px;
+  }
+}
+
+@layer utilities {
+  /* Archivo variable width axis — industrial signage feel for display type */
+  .display-wide {
+    font-variation-settings: "wdth" 120;
+    letter-spacing: -0.01em;
+  }
+  .display-narrow {
+    font-variation-settings: "wdth" 88;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

@@ -1,0 +1,391 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Deploy-in-a-Box customer environment: multi-tenant data layer (DynamoDB),
+  Cognito auth, JWT-protected HTTP API on Lambda, S3 + CloudFront asset CDN.
+  All resource names are prefixed "diab-" so the connector role can be scoped
+  tightly. This template is the v1 infrastructure skeleton; the full
+  application-layer endpoint suite ships as code deployed on top of it.
+
+Parameters:
+  ProjectName:
+    Type: String
+    AllowedPattern: "^[a-z][a-z0-9-]{2,23}$"
+    Description: Lowercase project slug (3-24 chars).
+  Environment:
+    Type: String
+    AllowedValues: [staging, production]
+  EnableUsageBilling:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "false"
+    Description: Creates the metered UsageEvents table for usage-based billing.
+  CognitoCallbackUrl:
+    Type: String
+    Default: "http://localhost:3000/auth/callback"
+    Description: OAuth callback URL registered on the user pool client.
+
+Conditions:
+  UsageBillingOn: !Equals [!Ref EnableUsageBilling, "true"]
+
+Resources:
+  # ── Multi-tenant data layer ────────────────────────────────────────────────
+  # Single-table design. Every item key is tenant-scoped:
+  #   pk = TENANT#<tenantId>#<entity>   sk = <entity>#<id>
+  # GSI1 supports inverted/list access patterns. Tenant registry lives in
+  # TenantsTable. Enforcement happens in the API layer: the Lambda derives
+  # tenantId from the caller's JWT (custom:tenantId) and prefixes every key.
+  DataTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "diab-${ProjectName}-${Environment}-data"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: pk, AttributeType: S }
+        - { AttributeName: sk, AttributeType: S }
+        - { AttributeName: gsi1pk, AttributeType: S }
+        - { AttributeName: gsi1sk, AttributeType: S }
+      KeySchema:
+        - { AttributeName: pk, KeyType: HASH }
+        - { AttributeName: sk, KeyType: RANGE }
+      GlobalSecondaryIndexes:
+        - IndexName: gsi1
+          KeySchema:
+            - { AttributeName: gsi1pk, KeyType: HASH }
+            - { AttributeName: gsi1sk, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - { Key: "diab:project", Value: !Ref ProjectName }
+        - { Key: "diab:environment", Value: !Ref Environment }
+
+  TenantsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "diab-${ProjectName}-${Environment}-tenants"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: tenantId, AttributeType: S }
+      KeySchema:
+        - { AttributeName: tenantId, KeyType: HASH }
+      Tags:
+        - { Key: "diab:project", Value: !Ref ProjectName }
+        - { Key: "diab:environment", Value: !Ref Environment }
+
+  UsageEventsTable:
+    Type: AWS::DynamoDB::Table
+    Condition: UsageBillingOn
+    Properties:
+      TableName: !Sub "diab-${ProjectName}-${Environment}-usage-events"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: pk, AttributeType: S } # TENANT#<tenantId>#<yyyy-mm>
+        - { AttributeName: sk, AttributeType: S } # <timestamp>#<eventId>
+      KeySchema:
+        - { AttributeName: pk, KeyType: HASH }
+        - { AttributeName: sk, KeyType: RANGE }
+      TimeToLiveSpecification: { AttributeName: ttl, Enabled: true }
+      Tags:
+        - { Key: "diab:project", Value: !Ref ProjectName }
+        - { Key: "diab:environment", Value: !Ref Environment }
+
+  # ── Auth (Cognito) ─────────────────────────────────────────────────────────
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub "diab-${ProjectName}-${Environment}"
+      UsernameAttributes: [email]
+      AutoVerifiedAttributes: [email]
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 10
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireUppercase: true
+          RequireSymbols: false
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+        - Name: tenantId
+          AttributeDataType: String
+          Mutable: true
+          StringAttributeConstraints: { MinLength: "1", MaxLength: "64" }
+        - Name: role
+          AttributeDataType: String
+          Mutable: true
+          StringAttributeConstraints: { MinLength: "1", MaxLength: "32" }
+      UserPoolTags:
+        "diab:project": !Ref ProjectName
+        "diab:environment": !Ref Environment
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub "diab-${ProjectName}-${Environment}-web"
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_USER_PASSWORD_AUTH
+      SupportedIdentityProviders: [COGNITO]
+      CallbackURLs: [!Ref CognitoCallbackUrl]
+      AllowedOAuthFlowsUserPoolClient: false
+      PreventUserExistenceErrors: ENABLED
+      AccessTokenValidity: 1
+      IdTokenValidity: 1
+      RefreshTokenValidity: 30
+      TokenValidityUnits:
+        AccessToken: hours
+        IdToken: hours
+        RefreshToken: days
+
+  # ── API (HTTP API + Lambda, JWT-protected) ────────────────────────────────
+  ApiFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "diab-${ProjectName}-${Environment}-api-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: data-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                Resource:
+                  - !GetAtt DataTable.Arn
+                  - !Sub "${DataTable.Arn}/index/*"
+                  - !GetAtt TenantsTable.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  # Seed handler demonstrating the tenant-scoping pattern end to end.
+  # The full 40+ endpoint application layer deploys on top of this function
+  # (replace the inline code with your packaged bundle in a template revision).
+  ApiFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "diab-${ProjectName}-${Environment}-api"
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Timeout: 10
+      MemorySize: 256
+      Role: !GetAtt ApiFunctionRole.Arn
+      Environment:
+        Variables:
+          DATA_TABLE: !Ref DataTable
+          TENANTS_TABLE: !Ref TenantsTable
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          const { DynamoDBClient } = require("@aws-sdk/client-dynamodb");
+          const { DynamoDBDocumentClient, QueryCommand, PutCommand } = require("@aws-sdk/lib-dynamodb");
+          const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
+          const T = process.env.DATA_TABLE;
+          const res = (code, body) => ({ statusCode: code, headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+          const tenantOf = (event) => event.requestContext?.authorizer?.jwt?.claims?.["custom:tenantId"] || null;
+          exports.handler = async (event) => {
+            const route = event.routeKey;
+            if (route === "GET /health") return res(200, { ok: true, env: process.env.ENVIRONMENT });
+            const tenantId = tenantOf(event);
+            if (!tenantId) return res(403, { error: "No tenant claim on token. Set custom:tenantId on the user." });
+            if (route === "GET /me") {
+              const c = event.requestContext.authorizer.jwt.claims;
+              return res(200, { tenantId, email: c.email, role: c["custom:role"] || "member" });
+            }
+            if (route === "GET /items") {
+              const out = await ddb.send(new QueryCommand({ TableName: T,
+                KeyConditionExpression: "pk = :p", ExpressionAttributeValues: { ":p": `TENANT#${tenantId}#ITEM` } }));
+              return res(200, { items: out.Items || [] });
+            }
+            if (route === "POST /items") {
+              const body = JSON.parse(event.body || "{}");
+              const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+              const item = { pk: `TENANT#${tenantId}#ITEM`, sk: `ITEM#${id}`, id, name: String(body.name || "untitled"), createdAt: new Date().toISOString() };
+              await ddb.send(new PutCommand({ TableName: T, Item: item }));
+              return res(201, { item });
+            }
+            return res(404, { error: "route not found" });
+          };
+      Tags:
+        - { Key: "diab:project", Value: !Ref ProjectName }
+        - { Key: "diab:environment", Value: !Ref Environment }
+
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub "diab-${ProjectName}-${Environment}"
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins: ["*"]
+        AllowMethods: [GET, POST, PUT, DELETE, OPTIONS]
+        AllowHeaders: [authorization, content-type]
+
+  JwtAuthorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Properties:
+      ApiId: !Ref HttpApi
+      AuthorizerType: JWT
+      Name: cognito-jwt
+      IdentitySource: ["$request.header.Authorization"]
+      JwtConfiguration:
+        Audience: [!Ref UserPoolClient]
+        Issuer: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}"
+
+  ApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt ApiFunction.Arn
+      PayloadFormatVersion: "2.0"
+
+  RouteHealth:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: "GET /health"
+      Target: !Sub "integrations/${ApiIntegration}"
+
+  RouteMe:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: "GET /me"
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub "integrations/${ApiIntegration}"
+
+  RouteListItems:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: "GET /items"
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub "integrations/${ApiIntegration}"
+
+  RouteCreateItem:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: "POST /items"
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub "integrations/${ApiIntegration}"
+
+  ApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: "$default"
+      AutoDeploy: true
+
+  ApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ApiFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*"
+
+  # ── Assets: S3 + CloudFront ────────────────────────────────────────────────
+  AssetsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "diab-${ProjectName}-${Environment}-assets-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      Tags:
+        - { Key: "diab:project", Value: !Ref ProjectName }
+        - { Key: "diab:environment", Value: !Ref Environment }
+
+  CdnOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "diab-${ProjectName}-${Environment}-oac"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  CdnDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub "diab-${ProjectName}-${Environment} assets"
+        DefaultRootObject: index.html
+        HttpVersion: http2
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: assets-s3
+            DomainName: !GetAtt AssetsBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt CdnOriginAccessControl.Id
+            S3OriginConfig: { OriginAccessIdentity: "" }
+        DefaultCacheBehavior:
+          TargetOriginId: assets-s3
+          ViewerProtocolPolicy: redirect-to-https
+          # AWS managed CachingOptimized policy
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+        ViewerCertificate: { CloudFrontDefaultCertificate: true }
+      Tags:
+        - { Key: "diab:project", Value: !Ref ProjectName }
+        - { Key: "diab:environment", Value: !Ref Environment }
+
+  AssetsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AssetsBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudFrontOAC
+            Effect: Allow
+            Principal: { Service: cloudfront.amazonaws.com }
+            Action: s3:GetObject
+            Resource: !Sub "${AssetsBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${CdnDistribution}"
+
+Outputs:
+  Region:
+    Value: !Ref AWS::Region
+  UserPoolId:
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Value: !Ref UserPoolClient
+  ApiEndpoint:
+    Value: !GetAtt HttpApi.ApiEndpoint
+  DataTableName:
+    Value: !Ref DataTable
+  TenantsTableName:
+    Value: !Ref TenantsTable
+  AssetsBucketName:
+    Value: !Ref AssetsBucket
+  CdnDomainName:
+    Value: !GetAtt CdnDistribution.DomainName
